@@ -76,7 +76,8 @@ type Controller struct {
 	configMapLister listerscorev1.ConfigMapLister
 	machinesLister  machinelistersv1alpha1.MachineLister
 
-	workqueue workqueue.RateLimitingInterface
+	workqueue     workqueue.RateLimitingInterface
+	nodeWorkqueue workqueue.RateLimitingInterface
 
 	sshPrivateKey *ssh.PrivateKey
 	clusterDNSIPs []net.IP
@@ -113,7 +114,8 @@ func NewMachineController(
 		machineClient:  machineClient,
 		machinesLister: machineInformer.Lister(),
 
-		workqueue: workqueue.NewNamedRateLimitingQueue(workqueue.NewItemFastSlowRateLimiter(2*time.Second, 10*time.Second, 5), "Machines"),
+		workqueue:     workqueue.NewNamedRateLimitingQueue(workqueue.NewItemFastSlowRateLimiter(2*time.Second, 10*time.Second, 5), "Machines"),
+		nodeWorkqueue: workqueue.NewNamedRateLimitingQueue(workqueue.NewItemFastSlowRateLimiter(2*time.Second, 10*time.Second, 5), "Nodes"),
 
 		sshPrivateKey: sshKeypair,
 		clusterDNSIPs: clusterDNSIPs,
@@ -151,9 +153,11 @@ func NewMachineController(
 func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
 	defer runtime.HandleCrash()
 	defer c.workqueue.ShutDown()
+	defer c.nodeWorkqueue.ShutDown()
 
 	for i := 0; i < threadiness; i++ {
 		go wait.Until(c.runWorker, time.Second, stopCh)
+		go wait.Until(c.runNodeWorker, time.Second, stopCh)
 	}
 
 	c.metrics.Workers.Set(float64(threadiness))
@@ -165,6 +169,11 @@ func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
 
 func (c *Controller) runWorker() {
 	for c.processNextWorkItem() {
+	}
+}
+
+func (c *Controller) runNodeWorker() {
+	for c.processNextNodeWorkItem() {
 	}
 }
 
@@ -185,6 +194,27 @@ func (c *Controller) processNextWorkItem() bool {
 
 	utilruntime.HandleError(fmt.Errorf("%v failed with: %v", key, err))
 	c.workqueue.AddRateLimited(key)
+
+	return true
+}
+
+func (c *Controller) processNextNodeWorkItem() bool {
+	key, quit := c.nodeWorkqueue.Get()
+	if quit {
+		return false
+	}
+
+	defer c.nodeWorkqueue.Done(key)
+
+	glog.V(6).Infof("Processing node: %s", key)
+	err := c.syncNode(key.(string))
+	if err == nil {
+		c.nodeWorkqueue.Forget(key)
+		return true
+	}
+
+	utilruntime.HandleError(fmt.Errorf("%v failed with: %v", key, err))
+	c.nodeWorkqueue.AddRateLimited(key)
 
 	return true
 }
@@ -234,6 +264,130 @@ func (c *Controller) validateMachine(prov cloud.Provider, machine *machinev1alph
 	start := time.Now()
 	defer c.metrics.ControllerOperation.With("operation", "validate-machine").Observe(time.Since(start).Seconds())
 	return prov.Validate(machine.Spec)
+}
+
+func (c *Controller) syncNode(key string) error {
+	listerNode, err := c.nodesLister.Get(key)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			glog.V(2).Infof("node '%s' in work queue no longer exists", key)
+			return nil
+		}
+		return err
+	}
+
+	ownerRef := metav1.GetControllerOf(listerNode)
+	// ownerRef is alrady set, nothing to do
+	if ownerRef != nil {
+		return nil
+	}
+
+	// If there is a machine without a NodeRef, try matching it
+	// TODO: find a better solution, this approach results in a GET for all machines everytime a node changes
+	machines, err := c.machinesLister.List(labels.Everything())
+	if err != nil {
+		return fmt.Errorf("Error requesting machines: '%v'", err)
+	}
+	for _, machine := range machines {
+		if machine.Status.NodeRef == nil {
+			node := listerNode.DeepCopy()
+			gv := machinev1alpha1.SchemeGroupVersion
+
+			// Get provider and provider instance
+			providerConfig, err := providerconfig.GetConfig(machine.Spec.ProviderConfig)
+			if err != nil {
+				return fmt.Errorf("failed to get provider config: %v", err)
+			}
+			prov, err := cloudprovider.ForProvider(providerConfig.CloudProvider, c.sshPrivateKey)
+			if err != nil {
+				return fmt.Errorf("failed to get cloud provider %q: %v", providerConfig.CloudProvider, err)
+			}
+			providerInstance, err := prov.Get(machine)
+			if err != nil {
+				return fmt.Errorf("error getting provider instance for machine '%s': '%v'", machine.Name, err)
+			}
+
+			// Try maching by address
+			if doesNodeMatchMachineByAddress(listerNode, providerInstance) {
+				node.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(machine, gv.WithKind(machineKind))}
+				node, err = c.kubeClient.CoreV1().Nodes().Update(node)
+				if err != nil {
+					return fmt.Errorf("failed to update node %s after adding the owner ref: %v", node.Name, err)
+				}
+				glog.V(4).Infof("Added owner ref to node %s (machine=%s)", node.Name, machine.Name)
+				c.metrics.NodeJoinDuration.Observe(node.CreationTimestamp.Sub(machine.CreationTimestamp.Time).Seconds())
+
+				if node.Spec.ConfigSource == nil && machine.Spec.ConfigSource != nil {
+					node.Spec.ConfigSource = machine.Spec.ConfigSource
+					node, err = c.kubeClient.CoreV1().Nodes().Update(node)
+					if err != nil {
+						return fmt.Errorf("failed to update node %s after setting the config source: %v", node.Name, err)
+					}
+					glog.V(4).Infof("Added config source to node %s (machine %s)", node.Name, machine.Name)
+				}
+
+				var labelsUpdated bool
+				for k, v := range machine.Spec.Labels {
+					if _, exists := node.Labels[k]; !exists {
+						labelsUpdated = true
+						node.Labels[k] = v
+					}
+				}
+				if labelsUpdated {
+					node, err = c.kubeClient.CoreV1().Nodes().Update(node)
+					if err != nil {
+						return fmt.Errorf("failed to update node %s after setting the labels: %v", node.Name, err)
+					}
+					glog.V(4).Infof("Added labels to node %s (machine %s)", node.Name, machine.Name)
+				}
+
+				var annotationsUpdated bool
+				for k, v := range machine.Spec.Annotations {
+					if _, exists := node.Annotations[k]; !exists {
+						annotationsUpdated = true
+						node.Annotations[k] = v
+					}
+				}
+				if annotationsUpdated {
+					node, err = c.kubeClient.CoreV1().Nodes().Update(node)
+					if err != nil {
+						return fmt.Errorf("failed to update node %s after setting the annotations: %v", node.Name, err)
+					}
+					glog.V(4).Infof("Added annotations to node %s (machine %s)", node.Name, machine.Name)
+				}
+
+				taintExists := func(node *corev1.Node, taint corev1.Taint) bool {
+					for _, t := range node.Spec.Taints {
+						if t.MatchTaint(&taint) {
+							return true
+						}
+					}
+					return false
+				}
+				var taintsUpdated bool
+				for _, t := range machine.Spec.Taints {
+					if !taintExists(node, t) {
+						node.Spec.Taints = append(node.Spec.Taints, t)
+						taintsUpdated = true
+					}
+				}
+				if taintsUpdated {
+					node, err = c.kubeClient.CoreV1().Nodes().Update(node)
+					if err != nil {
+						return fmt.Errorf("failed to update node %s after setting the taints: %v", node.Name, err)
+					}
+					glog.V(4).Infof("Added taints to node %s (machine %s)", node.Name, machine.Name)
+				}
+
+				err = c.updateMachineStatus(machine, node)
+				if err != nil {
+					return fmt.Errorf("failed to update machine status: %v", err)
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 func (c *Controller) syncHandler(key string) error {
@@ -368,90 +522,6 @@ func (c *Controller) syncHandler(key string) error {
 		}
 	}
 
-	node, exists, err := c.getNode(providerInstance, string(providerConfig.CloudProvider))
-	if err != nil {
-		return fmt.Errorf("failed to get node for machine %s: %v", machine.Name, err)
-	}
-	if exists {
-		ownerRef := metav1.GetControllerOf(node)
-		if ownerRef == nil {
-			gv := machinev1alpha1.SchemeGroupVersion
-			node.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(machine, gv.WithKind(machineKind))}
-			node, err = c.kubeClient.CoreV1().Nodes().Update(node)
-			if err != nil {
-				return fmt.Errorf("failed to update node %s after adding the owner ref: %v", node.Name, err)
-			}
-			glog.V(4).Infof("Added owner ref to node %s (machine=%s)", node.Name, machine.Name)
-			c.metrics.NodeJoinDuration.Observe(node.CreationTimestamp.Sub(machine.CreationTimestamp.Time).Seconds())
-		}
-
-		if node.Spec.ConfigSource == nil && machine.Spec.ConfigSource != nil {
-			node.Spec.ConfigSource = machine.Spec.ConfigSource
-			node, err = c.kubeClient.CoreV1().Nodes().Update(node)
-			if err != nil {
-				return fmt.Errorf("failed to update node %s after setting the config source: %v", node.Name, err)
-			}
-			glog.V(4).Infof("Added config source to node %s (machine %s)", node.Name, machine.Name)
-		}
-
-		var labelsUpdated bool
-		for k, v := range machine.Spec.Labels {
-			if _, exists := node.Labels[k]; !exists {
-				labelsUpdated = true
-				node.Labels[k] = v
-			}
-		}
-		if labelsUpdated {
-			node, err = c.kubeClient.CoreV1().Nodes().Update(node)
-			if err != nil {
-				return fmt.Errorf("failed to update node %s after setting the labels: %v", node.Name, err)
-			}
-			glog.V(4).Infof("Added labels to node %s (machine %s)", node.Name, machine.Name)
-		}
-
-		var annotationsUpdated bool
-		for k, v := range machine.Spec.Annotations {
-			if _, exists := node.Annotations[k]; !exists {
-				annotationsUpdated = true
-				node.Annotations[k] = v
-			}
-		}
-		if annotationsUpdated {
-			node, err = c.kubeClient.CoreV1().Nodes().Update(node)
-			if err != nil {
-				return fmt.Errorf("failed to update node %s after setting the annotations: %v", node.Name, err)
-			}
-			glog.V(4).Infof("Added annotations to node %s (machine %s)", node.Name, machine.Name)
-		}
-
-		taintExists := func(node *corev1.Node, taint corev1.Taint) bool {
-			for _, t := range node.Spec.Taints {
-				if t.MatchTaint(&taint) {
-					return true
-				}
-			}
-			return false
-		}
-		var taintsUpdated bool
-		for _, t := range machine.Spec.Taints {
-			if !taintExists(node, t) {
-				node.Spec.Taints = append(node.Spec.Taints, t)
-				taintsUpdated = true
-			}
-		}
-		if taintsUpdated {
-			node, err = c.kubeClient.CoreV1().Nodes().Update(node)
-			if err != nil {
-				return fmt.Errorf("failed to update node %s after setting the taints: %v", node.Name, err)
-			}
-			glog.V(4).Infof("Added taints to node %s (machine %s)", node.Name, machine.Name)
-		}
-	}
-
-	err = c.updateMachineStatus(machine, node)
-	if err != nil {
-		return fmt.Errorf("failed to update machine status: %v", err)
-	}
 	return nil
 }
 
@@ -517,26 +587,33 @@ func parseContainerRuntime(s string) (runtime, version string, err error) {
 	return "", "", fmt.Errorf("invalid format. Expected 'runtime://version'")
 }
 
-func (c *Controller) getNode(instance instance.Instance, provider string) (node *corev1.Node, exists bool, err error) {
-	nodes, err := c.nodesLister.List(labels.Everything())
-	if err != nil {
-		return nil, false, err
-	}
+//func (c *Controller) getNode(instance instance.Instance, provider string) (node *corev1.Node, exists bool, err error) {
+//	nodes, err := c.nodesLister.List(labels.Everything())
+//	if err != nil {
+//		return nil, false, err
+//	}
+//
+//	providerID := fmt.Sprintf("%s:///%s", provider, instance.ID())
+//	for _, node := range nodes {
+//		if node.Spec.ProviderID == providerID {
+//			return node.DeepCopy(), true, nil
+//		}
+//		if doesNodeMatchMachineByAddress(node, instance) {
+//			return node.DeepCopy(), true, nil
+//		}
+//	}
+//	return nil, false, nil
+//}
 
-	providerID := fmt.Sprintf("%s:///%s", provider, instance.ID())
-	for _, node := range nodes {
-		if node.Spec.ProviderID == providerID {
-			return node.DeepCopy(), true, nil
-		}
-		for _, nodeAddress := range node.Status.Addresses {
-			for _, instanceAddress := range instance.Addresses() {
-				if nodeAddress.Address == instanceAddress {
-					return node.DeepCopy(), true, nil
-				}
+func doesNodeMatchMachineByAddress(node *corev1.Node, instance instance.Instance) bool {
+	for _, nodeAddress := range node.Status.Addresses {
+		for _, instanceAddress := range instance.Addresses() {
+			if nodeAddress.Address == instanceAddress {
+				return true
 			}
 		}
 	}
-	return nil, false, nil
+	return false
 }
 
 func (c *Controller) defaultContainerRuntime(machine *machinev1alpha1.Machine, prov userdata.Provider) (*machinev1alpha1.Machine, error) {
