@@ -62,6 +62,18 @@ type configVarStringInheritant struct {
 	ConfigVarString `json:",inline"`
 }
 
+func (c configVarStringInheritant) Namespace() string {
+	return c.ConfigVarString.ValueFrom.Namespace
+}
+
+func (c configVarStringInheritant) Name() string {
+	return c.ConfigVarString.ValueFrom.Name
+}
+
+func (c configVarStringInheritant) Key() string {
+	return c.ConfigVarString.ValueFrom.Key
+}
+
 func (configVarString *ConfigVarString) UnmarshalJSON(b []byte) error {
 	if !strings.Contains(string(b), "{") {
 		configVarString = &ConfigVarString{Value: string(b)}
@@ -74,8 +86,16 @@ func (configVarString *ConfigVarString) UnmarshalJSON(b []byte) error {
 	if err != nil {
 		return err
 	}
-	objr := v1.ObjectReference{Namespace: cvsDummy.Namespace, Name: cvsDummy.Name}
-	cvs := ConfigVarString{ObjectReference: objr, Key: cvsDummy.Key}
+	objr := v1.ObjectReference{
+		Namespace: cvsDummy.Namespace(),
+		Name:      cvsDummy.Name(),
+	}
+	cvs := ConfigVarString{
+		ValueFrom: GlobalSecretKeySelector{
+			ObjectReference: &objr,
+			Key:             cvsDummy.Key(),
+		},
+	}
 	configVarString = &cvs
 	return nil
 	//	var cvs map[string]interface{}
