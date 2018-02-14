@@ -44,6 +44,7 @@ type RawConfig struct {
 	Backups           providerconfig.ConfigVarBool     `json:"backups"`
 	IPv6              providerconfig.ConfigVarBool     `json:"ipv6"`
 	PrivateNetworking providerconfig.ConfigVarBool     `json:"private_networking"`
+	Monitoring        providerconfig.ConfigVarBool     `json:"monitoring"`
 	Tags              []providerconfig.ConfigVarString `json:"tags"`
 }
 
@@ -54,6 +55,7 @@ type Config struct {
 	Backups           bool
 	IPv6              bool
 	PrivateNetworking bool
+	Monitoring        bool
 	Tags              []string
 }
 
@@ -114,6 +116,7 @@ func getConfig(s runtime.RawExtension) (*Config, *providerconfig.Config, error) 
 	c.Backups = rawConfig.Backups.Value
 	c.IPv6 = rawConfig.IPv6.Value
 	c.PrivateNetworking = rawConfig.PrivateNetworking.Value
+	c.Monitoring = rawConfig.Monitoring.Value
 	for _, tag := range rawConfig.Tags {
 		c.Tags = append(c.Tags, tag.Value)
 	}
@@ -255,6 +258,7 @@ func (p *provider) Create(machine *v1alpha1.Machine, userdata string) (instance.
 		IPv6:              c.IPv6,
 		PrivateNetworking: c.PrivateNetworking,
 		Backups:           c.Backups,
+		Monitoring:        c.Monitoring,
 		UserData:          userdata,
 		SSHKeys:           []godo.DropletCreateSSHKey{{Fingerprint: fingerprint}},
 		Tags:              append(c.Tags, string(machine.UID)),
